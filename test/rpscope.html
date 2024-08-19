@@ -1,0 +1,473 @@
+<html><!DOCTYPE html><html lang="en">
+<!-- Canvas-based oscilloscope display
+     v0.01 JPB 14/6/21 Adapted from sigscope.html v0.08
+     v0.02 JPB 1/9/21  Added capture interface
+     v0.03 JPB 21/10/21
+     v0.04 JPB 14/5/24 Use http fetch in place of XMLHttpRequest (for CORS)
+                       Display page arguments on startup
+     v0.05 JPB 14/5/24 Moved status text to button line
+                       Set ip address using rem_ip HTTP parameter
+     v0.06 JPB 4/6/24  Added capture state machine
+     v0.07 JPB 4/6/24  Initial scope display
+     v0.08 JPB 4/7/24  Removed unnecessary HTML table
+                       Added capture parameters
+     v0.09 JPB 8/7/24  Added logic analyser plot
+     v0.10 JPB 9/7/24  Added display mode selection
+     v0.11 JPB 9/7/24  Simplified analogue scaling
+     v0.12 JPB 15/7/24 Added binary file transfer
+     v0.13 JPB 15/7/24 For binary data, Use XMLHttpRequest in place of fetch
+                       Corrected state machine error handling
+     v0.14 JPB 16/7/24 Added ability to stop a slow capture
+     v0.15 JPB 11/8/24 Added analog sensitivity settings to display mode
+-->
+<head><meta charset="utf-8"/><style>
+      body    {margin:0; border:0; overflow:hidden; display:block;}
+      div     {position:relative; top:10px; background-color:#f0f0f0;}
+      canvas  {position:relative; left:10px;}
+      button, select, input  {border-radius:8px; padding:5px;}
+      td      {font-size: 14px; font-family: verdana}
+</style></head><body>
+    <div style="left:0;"><canvas id="canvas1"></canvas></div>
+    <div>
+        &nbsp;&nbsp;
+        <button id="single_btn" onclick="doSingle()">Single</button>
+        <button id="repeat_btn" onclick="doRepeat()">Repeat</button>
+        <select id="sel_samples" onchange="setSamples()"></select>
+        at <select id="sel_xrate" onchange="setXrate()"></select>
+        from <input type="text" size=12 id="rem_ip_text"></input>
+        &nbsp;&nbsp;
+        <button id="display_btn" onclick="doDisplay()">Display</button>
+        <select id="sel_disp_mode" onchange="setDispMode()"></select>
+        <select id="sel_zoom" onchange="setZoom()"></select>
+        &nbsp;&nbsp;
+        <pre id="status"style="display:inline-block;text-align:left;">test</pre>
+    </div>
+    <script type="text/javascript" language="javascript"> "use strict";
+
+    const VERSION = "RPScope v0.14";
+    dispStatus(VERSION);
+    const NSAMP_VALS = [10000, 20000, 50000, 100000];
+    const XRATE_VALS = [10000, 20000, 50000, 100000, 200000, 500000,
+                        1000000, 2000000, 5000000, 10000000, 20000000, 
+                        40000000, 60000000];
+const ZOOM_VALS = [1, 2, 5, 10, 20, 50];
+    const DISP_MODES = [0.1, 0.2, 0.5, 1.0, 8, 16];
+    const XDIVISIONS=10, YDIVISIONS=8, ANALOG_SCALE = 0.82, ANALOG_ZERO = 512;
+    var analog_min = 0, analog_max = ANALOG_ZERO*2;
+    var nsamples=10000, xrate=100000, xzoom=1, xoffset=0;
+    var dragging=false, lastX, moveX=0, seqNum=0;
+    var btn_ht = 12, txt_ht=24, winxpad=10, winypad=6, lmargin=27, bmargin=25;
+    var label_ht=14, tracelabels=[];
+    var graph_background="#d8e8d8", grid_colour="#40f040", marker_colour="#008000";
+    const STATUS_TIMEOUT=2000, DATA_TIMEOUT=10000, STATE_POLL_TIME=100;
+    const STATE_IDLE=0, STATE_READY=1, STATE_CAPTURING=2, STATE_ERROR=3;
+    const START_SINGLE=1, START_MULTI=2;
+    var capstatus = null, capstate = STATE_IDLE, capstart = 0;
+    var rem_ip = "192.168.178.30";
+    const statusfile = "status.txt", datafile = "data.bin";
+    var ctx1 = elem("canvas1").getContext("2d");
+    set_select("sel_samples", NSAMP_VALS, " Samples", nsamples)
+    set_select("sel_xrate", XRATE_VALS, " S/s", xrate);
+    set_select("sel_zoom", ZOOM_VALS, "x zoom", xzoom);
+    var sel = elem("sel_disp_mode");
+    for (var n=0; n<DISP_MODES.length; n++) {
+        var s = String(DISP_MODES[n]) + (DISP_MODES[n] <= 1.0 ? "V analog" : " digital");
+        sel.options.add(new Option(s, DISP_MODES[n]));
+    }
+    var capdata = makeTrace(nsamples);
+    window.addEventListener('resize', resize, false);
+    elem("canvas1").addEventListener('mousedown', mouseDown);
+    window.addEventListener('mousemove', mouseMove);
+    window.addEventListener('mouseup', mouseUp);
+
+    var params = getPageParams();
+    console.log("Page parameters:", params);
+    var params = getCapParams();
+    console.log("Capture parameters:", params);
+    rem_ip_text.value = rem_ip;
+    resize();
+    setDispMode();
+    statePoll();
+
+    // Poll the data capture state machine
+    function statePoll() {
+        if (capstate == STATE_IDLE || capstate == STATE_READY || capstate == STATE_ERROR) {
+            if (capstart) {
+                capstate = STATE_CAPTURING;
+                capdata = capstatus = null;
+                dispStatus("Capturing..");
+                if (capstart == START_SINGLE) {
+                    capstart = 0;
+                }
+                getStatus("cmd=1");
+            }
+        }
+        else if (capstate == STATE_CAPTURING) {
+            if (capstatus && capstatus.state == STATE_READY) {
+                dispStatus("Fetching data..");
+                getData();
+                capstate = STATE_READY;
+                if (capstart != START_MULTI) {
+                    elem("repeat_btn").textContent = "Repeat";
+                }
+            }
+            else if (capstatus && capstatus.state == STATE_ERROR) {
+                dispStatus("Capture failed");
+                capstate = STATE_ERROR;
+                elem("repeat_btn").textContent = "Repeat";
+            }
+            else {
+                capstatus = null;
+                getStatus();
+            }
+        }
+        else if (capstate == STATE_READY) {
+        }
+        else if (capstate == STATE_ERROR) {
+            capstart = 0;
+        }
+        window.setTimeout(statePoll, STATE_POLL_TIME);
+    }
+
+    // Get capture parameters
+    function getCapParams(cmd=null) {
+      var params = [];
+      params.push("xsamp=" + elem("sel_samples").value);
+      params.push("xrate=" + elem("sel_xrate").value);
+      return params;
+    }
+
+    // Get the parameters of the current page request
+    function getPageParams() {
+        var dict = {};
+        const prms = new URLSearchParams(window.location.search);
+        for (const [key, value] of prms) {
+            dict[key] = value;
+        }
+        if ("rem_ip" in dict)
+            rem_ip = dict["rem_ip"];
+        return dict;
+    }
+
+    // Return number string scaled using k or M multipliers
+    function scaled(n) {
+        return n<1000 ? n+"" : n<1000000 ? n/1000+"k" : n/1000000+"M";
+    }
+
+    // Set the options for a 'select' control
+    function set_select(ctrl, vals, units, val=null) {
+        var sel = elem(ctrl);
+        for (var n=0; n<vals.length; n++)
+            sel.options.add(new Option(scaled(vals[n])+units, vals[n]));
+        if (val != null)
+            sel.value = val;
+    }
+
+    // Clear a canvas
+    function clearCanvas(ctx, colr) {
+        ctx.fillStyle = colr;
+        ctx.fillRect(0, 0, ctx.canvas.clientWidth, ctx.canvas.clientHeight);
+    }
+
+    // Calculate the x-value in msec given sample number
+    function sampMsec(n) {
+        return n * 1000 / xrate;
+    }
+
+    // Calculate the x-value in msec given div number
+    function divMsec(n) {
+        return sampMsec(xoffset) + sampMsec(n*nsamples/(XDIVISIONS*xzoom));
+    }
+
+    // Calculate data values for dummy analog trace
+    function makeTrace(nsamp) {
+        var vals = [], mid = (analog_max - analog_min) / 2;
+        for (var n=0; n<nsamp; n++) {
+            vals.push(Math.sin(n/(nsamp/10)) * mid/20 + mid);
+        }
+        return vals;
+    }
+
+    // Calculate data values for dummy digital traces
+    function makeLogic(nsamp) {
+        var vals = [];
+        for (var n=0; n<nsamp; n++) {
+            vals.push(n);
+        }
+        return vals;
+    }
+
+    // Draw grid in canvas
+    function drawGrid(ctx) {
+        var w=ctx.canvas.clientWidth-lmargin, h=ctx.canvas.clientHeight-bmargin;
+        var dw = w/XDIVISIONS, dh=h/YDIVISIONS;
+        clearCanvas(ctx, graph_background);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = grid_colour;
+        ctx.strokeRect(lmargin, 1, w-1, h-1);
+        ctx.beginPath();
+        for (var n=0; n<XDIVISIONS; n++) {
+            var x = lmargin + n*dw;
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            if (n%2 == 0)
+                drawXMarker(ctx, divMsec(n).toFixed(3), x, h);
+        }
+        for (var n=YDIVISIONS+1; n>0; n--) {
+            var y = n*dh, mode = dispMode();
+            ctx.moveTo(lmargin, y);
+            ctx.lineTo(lmargin+w, y);
+            if (dispMode() <= 1) {
+                val = ((YDIVISIONS/2 - n) * mode).toFixed(1);
+            }
+            else {
+                var val = (n - 1) * mode / YDIVISIONS;
+                y -= mode == 16 ? dh : 0;
+            }
+            drawYMarker(ctx, val, lmargin, y);
+        }
+        ctx.stroke();
+    }
+
+    // Draw analog or digital traces
+    function drawTrace(ctx, data) {
+        if (dispMode() > 1)
+            drawLogic(ctx, data);
+        else
+            drawAnalog(ctx, data);
+    }
+
+    // Draw logic traces
+    function drawLogic(ctx, data) {
+        for (var bit=0; bit<dispMode(); bit++) {
+            drawLogicLine(ctx, bit, data);
+        }
+    }
+
+    // Draw a digital trace
+    function drawLogicLine(ctx, bit, data) {
+        var w=ctx.canvas.clientWidth, h=ctx.canvas.clientHeight-bmargin;
+        var y0 = (bit + 1) * h/dispMode() - 2, y1 = y0 - 0.8*h/dispMode();
+        var dx = w * xzoom / data.length, msk=1<<bit, val, lastval;
+        ctx.beginPath();
+        val = lastval = data[xoffset] & msk;
+        ctx.moveTo(lmargin, val ? y1 : y0);
+        for (var n=1; n<data.length/xzoom; n++) {
+            val = data[n + xoffset] & msk;
+            if (lastval != val) {
+                ctx.lineTo(lmargin+n*dx, lastval ? y1 : y0);
+                ctx.lineTo(lmargin+n*dx, val ? y1 : y0);
+                lastval = val;
+            }
+        }
+        ctx.lineTo(n*dx, val ? y1 : y0);
+        ctx.strokeStyle = "red";
+        ctx.stroke();
+    }
+
+    // Draw analog trace
+    function drawAnalog(ctx, data) {
+        var w=ctx.canvas.clientWidth-lmargin, h=ctx.canvas.clientHeight-bmargin;
+        var range = analog_max - analog_min, dx = w*xzoom/nsamples;
+        ctx.beginPath();
+        for (var n=0; n<nsamples/xzoom; n++) {
+            var normval = (data[n+xoffset] - analog_min) / range;
+            ctx.lineTo(lmargin + n*dx, h - normval*h);
+        }
+        ctx.strokeStyle = "red";
+        ctx.stroke();
+    }
+
+    // Draw marker for x-axis
+    function drawXMarker(ctx, s, x, y) {
+        ctx.font = label_ht + "px Arial";
+        ctx.textBaseline = "top";
+        ctx.textAlign = "left";
+        ctx.fillStyle = marker_colour;
+        ctx.fillRect(x, y, 1, label_ht);
+        ctx.fillText(s, x+2, y+2);
+    }
+
+    // Draw marker for y-axis
+    function drawYMarker(ctx, s, x, y) {
+        ctx.font = label_ht + "px Arial";
+        var w = ctx.measureText(s).width + 1;
+        ctx.textBaseline = "bottom";
+        ctx.textAlign = "right";
+        ctx.fillStyle = marker_colour;
+        ctx.fillRect(x-w, y, w, 1);
+        ctx.fillText(s, x-3, y);
+    }
+
+    // Respond to window being resized
+    function resize() {
+        ctx1.canvas.width = window.innerWidth - winxpad*2;
+        ctx1.canvas.height = window.innerHeight - btn_ht - txt_ht - winypad*2;
+        redraw();
+    }
+
+    // Redraw main display
+    function redraw() {
+        ctx1.clearRect(0, 0, ctx1.canvas.width, ctx1.canvas.height);
+        drawGrid(ctx1);
+        drawTrace(ctx1, capdata);
+    }
+
+    // Get status
+    function getStatus(cmd = "") {
+        var url = "http://" + rem_ip + "/" + statusfile;
+        var params = getCapParams();
+        url += "?" + encodeURI(params.join("&"));
+        if (cmd )
+            url += "&" + cmd;
+        const tout = new AbortController();
+        const toutId = setTimeout(() => tout.abort(), STATUS_TIMEOUT)
+        fetch(url, {signal: tout.signal}).then((response) => {
+            return response.text()
+        })
+        .then(resp => {
+            capstatus = JSON.parse(resp);
+            dispStatus(capstatus.nsamp + " samples");
+        })
+        .catch((e) => {
+            dispStatus("Can't get status");
+            capstate = STATE_ERROR;
+        });
+    }
+
+    // Get binary data
+    function getData(fname=datafile) {
+        var url = "http://" + rem_ip + "/" + fname;
+        var req = new XMLHttpRequest();
+        req.open( "GET", url);
+        req.responseType = "arraybuffer";
+        req.timeout = 5000;
+        req.onreadystatechange = req.ontimeout = function(e) {
+            if (req.readyState == 4) {
+                if (req.status == 200){
+                    var resp = e.target.response;
+                    capdata = new Uint16Array(resp);
+                    dispStatus("Fetched " + capdata.length + " samples");
+                    redraw();
+                }
+                else {
+                    dispStatus("Can't fetch data");
+                    capstate = STATE_ERROR;
+                }
+            }
+        }
+        req.send();
+    }
+
+    // Do a single capture
+    function doSingle() {
+        var btn = elem("repeat_btn");
+        btn.textContent = "Stop";
+        rem_ip = rem_ip_text.value;
+        capstart = START_SINGLE;
+    }
+
+    // Do multiple captures, or stop capturing
+    function doRepeat() {
+        var btn = elem("repeat_btn");
+        rem_ip = rem_ip_text.value;
+        if (btn.textContent == "Repeat") {
+            btn.textContent = "Stop";
+            capstart = START_MULTI;
+        }
+        else if (capstart == START_MULTI) {
+            btn.textContent = "Repeat";
+            capstart = 0;
+        }
+        else {
+            btn.textContent = "Repeat";
+            getStatus("cmd=0");
+        }
+    }
+
+    // Set number of samples
+    function setSamples(val) {
+        var sel = elem("sel_samples"), val = val==null ? sel.value : val;
+        nsamples = sel.value = val;
+    }
+
+    // Set sample rate
+    function setXrate(val) {
+        var sel = elem("sel_xrate"), val = val==null ? sel.value : val;
+        xrate = sel.value = val;
+    }
+
+    // Handle 'Display' button press
+    function doDisplay() {
+        getData();
+        sel_zoom.value = xzoom = 1;
+        xoffset = 0;
+        redraw();
+    }
+
+    // Set display mode
+    function setDispMode() {
+        var amp = ANALOG_ZERO * dispMode() * ANALOG_SCALE;
+        analog_max = ANALOG_ZERO + amp;
+        analog_min = ANALOG_ZERO - amp;
+        redraw();
+    }
+    
+    // Set zoom level
+    function setZoom(val) {
+        var sel = elem("sel_zoom"), val = val==null ? sel.value : val;
+        xzoom = sel.value = val;
+        if (val == 1)
+            xoffset = 0;
+        redraw();
+    }
+
+    // Respond to mouse button down
+    function mouseDown(e) {
+        var evt = e || event;
+        dragging = true;
+        lastX = evt.clientX;
+        e.preventDefault();
+    };
+
+    // Respond to mouse movement
+    function mouseMove(e) {
+        var evt = e || event;
+        if (dragging) {
+            var delta = evt.clientX - lastX;
+            lastX = evt.clientX;
+            moveX += delta;
+            ctx1.canvas.style.marginLeft = moveX + "px";
+        }
+        e.preventDefault();
+    }
+
+    // Respond to mouse button up
+    function mouseUp() {
+        xoffset += Math.round(-moveX * nsamples / ((ctx1.canvas.clientWidth-lmargin) * xzoom));
+        xoffset = XDIVISIONS * Math.round(xoffset / XDIVISIONS);
+        ctx1.canvas.style.marginLeft = moveX = 0;
+        if (dragging)
+            redraw();
+        dragging = false;
+    }
+
+    // Return a document element, given ID
+    function elem(id) {
+        return document.getElementById(id);
+    }
+
+    // Update the status display
+    function dispStatus(s) {
+        elem('status').innerHTML = s.trim();
+    }
+
+    // Return display mode (number of digital lines, <=1.0 for analog)
+    function dispMode() {
+        return elem("sel_disp_mode").value;
+    }
+
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,9 @@
+; Pico PIO program to input pin values to FIFO
+.program picocap
+.side_set 1
+.wrap_target
+    in pins, 16     side 0
+    in pins, 16     side 1
+.wrap
+; EOF
+
