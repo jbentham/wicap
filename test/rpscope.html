@@ -19,6 +19,7 @@
                        Corrected state machine error handling
      v0.14 JPB 16/7/24 Added ability to stop a slow capture
      v0.15 JPB 11/8/24 Added analog sensitivity settings to display mode
+     v0.16 JPB 26/8/24 Corrected analog signal inversion
 -->
 <head><meta charset="utf-8"/><style>
       body    {margin:0; border:0; overflow:hidden; display:block;}
@@ -408,8 +409,8 @@ const ZOOM_VALS = [1, 2, 5, 10, 20, 50];
     // Set display mode
     function setDispMode() {
         var amp = ANALOG_ZERO * dispMode() * ANALOG_SCALE;
-        analog_max = ANALOG_ZERO + amp;
-        analog_min = ANALOG_ZERO - amp;
+        analog_max = ANALOG_ZERO - amp;
+        analog_min = ANALOG_ZERO + amp;
         redraw();
     }
     
